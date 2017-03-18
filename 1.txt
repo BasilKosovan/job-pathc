@@ -1,0 +1,2255 @@
+ALTER PROCEDURE [time].[spGetTimecardSavedFilterAlertBatchItems]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@SavedFilterId INT,
+	@ContractId INT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@SourceIds [udt].[KeyList] READONLY,
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ShowAllVersions BIT,
+	@NumberSortOrder TINYINT,
+	@FormattedNameSortOrder TINYINT,
+	@LastNameSortOrder TINYINT
+AS
+BEGIN 
+	--> Init Data
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, 0, @StartDateUtc, @EndDateUtc;
+
+	IF EXISTS(SELECT * FROM #TimecardEntityTypeAccess)
+	BEGIN
+		DECLARE @IsNewOnly BIT;
+		DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+		DECLARE @SqlClause NVARCHAR(MAX) = '';
+		DECLARE @JoinClause NVARCHAR(MAX) = '';
+		DECLARE @WhereClause NVARCHAR(MAX) = '';
+		DECLARE @OrderClause NVARCHAR(MAX) = '';
+	
+		SELECT @IsNewOnly = [IsNewOnly] FROM [sfl].[SavedFilterAlert] WITH(NOLOCK) WHERE [Id] = @SavedFilterId;
+	
+		IF @IsNewOnly = 1
+		BEGIN
+			SET @WhereClause = '([T].[Id] NOT IN (SELECT [Id] FROM @UserSavedItemIds))';
+		END;
+	
+	--> Init filters
+
+		EXEC [time].[spInitTimecardFilter]
+			@SearchRegEx OUTPUT,
+			@SqlClause OUTPUT,
+			@JoinClause OUTPUT,
+			@WhereClause OUTPUT,
+			@OrderClause OUTPUT,
+			@AgencyIds,
+			@EmployerIds,
+			@CandidateIds,
+			@CostCenterIds,
+			@EntityStateIds,
+			@EntityStatusIds,
+			@SourceIds,
+			@Search,
+			@HasDocuments,
+			@ShowAllVersions,
+			@DaysToStartDate,
+			@DaysToEndDate,
+			@ContractId,
+			@NumberSortOrder, 
+			@FormattedNameSortOrder,
+			@LastNameSortOrder;
+
+		DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+			DECLARE @MaxAlertCount INT = 10;
+			DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+			DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+			DECLARE @OwnerEntityUserTypeId INT = 1;
+
+			DECLARE @TimecardFilter AS TABLE (
+				[TimecardId] INT NOT NULL,
+				[OrganizationId] INT NOT NULL,
+				[RowNumber] INT NOT NULL,
+				PRIMARY KEY CLUSTERED ([TimecardId] ASC, [OrganizationId] ASC)
+			);';
+
+		IF @IsNewOnly = 1
+		BEGIN
+			SET @Sql = @Sql + '
+				DECLARE @Data VARCHAR(MAX);
+				SELECT @Data = [Data]
+				FROM [sfl].[SavedFilterAlertUser] WITH(NOLOCK)
+				WHERE [SavedFilterId] = @SavedFilterId AND [UserId] = @UserId;
+
+				IF @Data IS NULL
+					SET @Data = '''';
+
+				DECLARE @UserSavedItemIds [udt].[KeyList];
+				BEGIN TRY
+					INSERT INTO @UserSavedItemIds
+					SELECT [Id]
+					FROM [dbo].[fnClrSplitStringToInt](@Data);
+				END TRY
+				BEGIN CATCH
+					THROW;
+					RETURN;
+				END CATCH;';
+		END;
+
+		SET @Sql = @Sql + '
+			INSERT INTO @TimecardFilter
+			SELECT
+				[T].[Id],
+				[TEA].[OrganizationId],
+				ROW_NUMBER() OVER (ORDER BY ' + @OrderClause + N') AS [RowNumber]
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]'
+				+ @JoinClause
+			+ @WhereClause + N';';
+
+		IF @IsNewOnly = 1
+		BEGIN
+			SET @Sql = @Sql + '
+				SET @Data = @Data + ISNULL((SELECT '','' + CAST([TimecardId] AS VARCHAR) From @TimecardFilter For XML PATH ('''')), '''');
+
+				UPDATE [sfl].[SavedFilterAlertUser]
+				SET [Data] = @Data
+				WHERE [SavedFilterId] = @SavedFilterId AND [UserId] = @UserId;
+			';
+		END;
+
+		SET @Sql = @Sql + '
+			DECLARE @UserOrganizations [udt].[KeyList];
+			INSERT INTO @UserOrganizations
+			SELECT [OrganizationId] FROM [acc].[fnGetUserOrganizations] (@UserId, @ContextOrganizationId);
+
+			-- Items
+			SELECT TOP(@MaxAlertCount)
+				[TF].[TimecardId],
+				[TF].[OrganizationId],
+				[T].[StartDateUtc],
+				[acc].[fnGetOrganizationName]([EEO].[OrganizationId], @UserOrganizations) AS [EmployerName],
+				CAST(DECRYPTBYKEY([U].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) AS [CandidateFormattedName],
+				[C].[JobTitle]
+			FROM @TimecardFilter [TF]
+				INNER JOIN [time].[Timecard] [T] WITH(NOLOCK) ON [T].[Id] = [TF].[TimecardId]
+				INNER JOIN [cnt].[Contract] [C] WITH(NOLOCK) ON [C].[Id] = [T].[ContractId]
+				LEFT JOIN [plt].[EntityOrganization] [EEO] WITH(NOLOCK) ON [EEO].[EntityInfoId] = [T].[EntityInfoId] AND [EEO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId
+				INNER JOIN [plt].[EntityOrganization] [CEO] WITH(NOLOCK) ON [CEO].[EntityInfoId] = [T].[EntityInfoId] AND [CEO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId
+				INNER JOIN [acc].[Organization] [O] WITH(NOLOCK) ON [O].[Id] = [CEO].[OrganizationId]
+				INNER JOIN [plt].[EntityUser] [CEU] WITH(NOLOCK) ON [CEU].[EntityInfoId] = [O].[EntityInfoId] AND [CEU].[EntityUserTypeId] = @OwnerEntityUserTypeId
+				INNER JOIN [acc].[User] [U] WITH(NOLOCK) ON [U].[Id] = [CEU].[UserId]
+			ORDER BY [TF].[RowNumber];
+
+			-- Items Count
+			SELECT
+				COUNT([TimecardId]) AS [Count]
+			FROM @TimecardFilter;';
+
+		DECLARE @Params NVARCHAR(MAX) = N'
+			@UserId INT,
+			@ContextOrganizationId INT,
+			@AgencyIds [udt].[KeyList] READONLY,
+			@EmployerIds [udt].[KeyList] READONLY,
+			@CandidateIds [udt].[KeyList] READONLY,
+			@CostCenterIds [udt].[KeyList] READONLY,
+			@EntityStateIds [udt].[KeyList] READONLY,
+			@EntityStatusIds [udt].[KeyList] READONLY,
+			@SourceIds [udt].[KeyList] READONLY,
+			@DaysToStartDate SMALLINT,
+			@DaysToEndDate SMALLINT,
+			@SavedFilterId INT,
+			@SearchRegEx NVARCHAR(MAX),
+			@IsNewOnly BIT';
+
+		EXECUTE sp_executesql @Sql, @Params,
+			@UserId,
+			@ContextOrganizationId,
+			@AgencyIds,
+			@EmployerIds,
+			@CandidateIds,
+			@CostCenterIds,
+			@EntityStateIds,
+			@EntityStatusIds,
+			@SourceIds,
+			@DaysToStartDate,
+			@DaysToEndDate,
+			@SavedFilterId,
+			@SearchRegEx,
+			@IsNewOnly;
+	END
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardAsyncDetails]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@TimecardId INT,
+	@OrganizationId INT,
+	@IncludeArchived INT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATETIME,
+	@EndDateUtc DATETIME,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@NumberSortOrder TINYINT,
+	@FormattedNameSortOrder TINYINT,
+	@LastNameSortOrder TINYINT
+AS
+BEGIN
+
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived , @StartDateUtc, @EndDateUtc;
+
+	DECLARE @NextTimecardId INT;
+	DECLARE @NextOrganizationId INT;
+	DECLARE @PreviousTimecardId INT;
+	DECLARE @PreviousOrganizationId INT;
+
+	EXEC [time].[spInitTimecardNavigation]
+		@UserId,
+		@NextTimecardId OUTPUT,
+		@NextOrganizationId OUTPUT,
+		@PreviousTimecardId OUTPUT,
+		@PreviousOrganizationId OUTPUT,
+		@TimecardId,
+		@OrganizationId,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@NumberSortOrder,
+		@FormattedNameSortOrder,
+		@LastNameSortOrder
+
+	-- Navigation
+
+	SELECT
+		@PreviousTimecardId AS [PreviousEntityId],
+		@PreviousOrganizationId AS [PreviousOrganizationId],
+		@NextTimecardId AS [NextEntityId],
+		@NextOrganizationId AS [NextOrganizationId];
+
+	DROP TABLE #TimecardEntityTypeAccess
+END
+GO
+
+ALTER PROCEDURE [time].[spInitTimecardNavigation]
+	@UserId INT,
+	@NextTimecardId INT OUTPUT,
+	@NextOrganizationId INT OUTPUT,
+	@PreviousTimecardId INT OUTPUT,
+	@PreviousOrganizationId INT OUTPUT,
+	@TimecardId INT,
+	@OrganizationId INT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@NumberSortOrder TINYINT,
+	@FormattedNameSortOrder TINYINT,
+	@LastNameSortOrder TINYINT
+AS
+BEGIN
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@ShowAllVersions,
+		@NumberSortOrder,
+		@FormattedNameSortOrder,
+		@LastNameSortOrder;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+		DECLARE @OwnerEntityUserTypeId INT = 1;
+
+		WITH [TimecardFilter] AS (
+			SELECT
+				[T].[Id],
+				[TEA].[OrganizationId],
+				ROW_NUMBER() OVER (ORDER BY ' + @OrderClause + N') AS [RowNumber]
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]'
+				+ @JoinClause
+			+ @WhereClause + 
+		N')
+		SELECT
+			@PreviousTimecardId = [TP].[Id],
+			@PreviousOrganizationId = [TP].[OrganizationId],
+			@NextTimecardId = [TN].[Id],
+			@NextOrganizationId = [TN].[OrganizationId]
+		FROM [TimecardFilter] [TF]
+			LEFT JOIN [TimecardFilter] [TP] ON [TP].[RowNumber] = [TF].[RowNumber] - 1
+			LEFT JOIN [TimecardFilter] [TN] ON [TN].[RowNumber] = [TF].[RowNumber] + 1
+		WHERE [TF].[Id] = @TimecardId AND [TF].[OrganizationId] = @OrganizationId;';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@NextTimecardId INT OUTPUT,
+		@NextOrganizationId INT OUTPUT,
+		@PreviousTimecardId INT OUTPUT,
+		@PreviousOrganizationId INT OUTPUT,
+		@TimecardId INT,
+		@OrganizationId INT,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@NextTimecardId OUTPUT,
+		@NextOrganizationId OUTPUT,
+		@PreviousTimecardId OUTPUT,
+		@PreviousOrganizationId OUTPUT,
+		@TimecardId,
+		@OrganizationId,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardAgencies]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	DECLARE @AgencyEntityAccess [udt].[EntityAccess_new];
+	INSERT INTO @AgencyEntityAccess
+	EXEC [acc].[spGetAgencyEntityTypeAccess] @UserId, @ContextOrganizationId, DEFAULT;
+
+	DECLARE @AgencyEntityOrganizationTypeId INT = 20;
+	DECLARE @Agencies [udt].[KeyList];
+	
+	INSERT INTO @Agencies
+	SELECT
+		[EO].[OrganizationId]
+	FROM #TimecardEntityTypeAccess [TEA]
+		INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [TEA].[EntityInfoId] AND [EO].[EntityOrganizationTypeId] = @AgencyEntityOrganizationTypeId
+	UNION
+	SELECT [OrganizationId] FROM @AgencyEntityAccess;
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		DEFAULT,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @UserOrganizations [udt].[KeyList];
+	INSERT INTO @UserOrganizations
+	SELECT [OrganizationId] FROM [acc].[fnGetUserOrganizations] (@UserId, @ContextOrganizationId);
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @AgencyEntityOrganizationTypeId INT = 20;
+
+		SELECT
+			[A].[Id] AS [Code],
+			[acc].[fnGetOrganizationName] ([A].[Id], @UserOrganizations) AS [Name],
+			(SELECT
+				COUNT([T].[Id])
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]
+				INNER JOIN [plt].[EntityOrganization] [AEO] WITH(NOLOCK) ON [AEO].[EntityInfoId] = [T].[EntityInfoId] AND [AEO].[EntityOrganizationTypeId] = @AgencyEntityOrganizationTypeId
+				INNER JOIN [acc].[OrganizationRelation] [AOR] WITH(NOLOCK) ON [AOR].[OrganizationId] = [AEO].[OrganizationId] AND [AOR].[RelatedOrganizationId] = [A].[Id] AND [AOR].[Level] = 1'
+				+ @JoinClause
+			+ @WhereClause + N') AS [Count]
+		FROM @Agencies [A]
+		ORDER BY [acc].[fnGetOrganizationPath]([A].[Id]);';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@UserOrganizations [udt].[KeyList] READONLY,
+		@Agencies [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@UserOrganizations,
+		@Agencies,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardCandidates]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@ItemsSearch NVARCHAR(128),
+	@ItemsSkip INT,
+	@ItemsTake INT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @ItemsSearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @ItemsWhereClause NVARCHAR(MAX) = '';
+	IF @ItemsSearch IS NOT NULL AND @ItemsSearch != ''
+	BEGIN
+		SET @ItemsSearchRegEx = '%' + @ItemsSearch + '%';
+		SET @ItemsWhereClause = 'WHERE CAST(DECRYPTBYKEY([vC].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) LIKE @ItemsSearchRegEx';
+	END;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = ' ([TEO].[OrganizationId] = [IF].[Id]) ';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	DECLARE @CandidateEntityAccess [udt].[EntityAccess_new];
+	SELECT * INTO #CandidateEntityTypeAccess FROM @CandidateEntityAccess;
+	EXEC [acc].[spGetCandidateEntityTypeAccess] @UserId, @ContextOrganizationId, DEFAULT;
+
+	DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+	DECLARE @Candidates [udt].[KeyList];
+
+	INSERT INTO @Candidates
+	SELECT
+		[EO].[OrganizationId]
+	FROM #TimecardEntityTypeAccess [TEA]
+		INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [TEA].[EntityInfoId] AND [EO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId
+	UNION
+	SELECT [OrganizationId] FROM #CandidateEntityTypeAccess
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		DEFAULT,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+
+		;WITH [ItemsFilter] AS (
+			SELECT
+				[vC].[Id],
+				CAST(DECRYPTBYKEY([vC].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) AS [Name],
+				ROW_NUMBER() OVER (ORDER BY CAST(DECRYPTBYKEY([vC].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) ASC) AS [RowNumber]
+			FROM @Candidates [C]
+				INNER JOIN [acc].[vCandidate] [vC] WITH(NOEXPAND) ON [vC].[Id] = [C].[Id]
+			' + @ItemsWhereClause + '
+		)
+		SELECT
+			[IF].[Id] AS [Code],
+			[IF].[Name] AS [Name],
+			(SELECT
+				COUNT([T].[Id])
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]
+				INNER JOIN [plt].[EntityOrganization] [TEO] WITH(NOLOCK) ON
+					[TEO].[EntityInfoId] = [T].[EntityInfoId] AND
+					[TEO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId
+				' + @JoinClause + '
+			' + @WhereClause + N'
+			) AS [Count]
+		FROM [ItemsFilter] [IF]
+		WHERE [IF].[RowNumber] > @ItemsSkip AND [IF].[RowNumber] <= @ItemsSkip + @ItemsTake
+		ORDER BY [IF].[RowNumber];';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@Candidates [udt].[KeyList] READONLY,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT,
+		@ItemsSearchRegEx NVARCHAR(MAX),
+		@ItemsSkip INT,
+		@ItemsTake INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@Candidates,
+		@AgencyIds,
+		@EmployerIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@ItemsSearchRegEx,
+		@ItemsSkip,
+		@ItemsTake;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+	DROP TABLE #CandidateEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardCostCenters]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@ItemsSearch NVARCHAR(128),
+	@ItemsSkip INT,
+	@ItemsTake INT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @ItemsSearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @ItemsWhereClause NVARCHAR(MAX) = '';
+	IF @ItemsSearch IS NOT NULL AND @ItemsSearch != ''
+	BEGIN
+		SET @ItemsSearchRegEx = '%' + @ItemsSearch + '%';
+		SET @ItemsWhereClause = 'WHERE [CC].[Name] LIKE @ItemsSearchRegEx';
+	END;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	DECLARE @EmployerEntityAccess [udt].[EntityAccess_new];
+	SELECT * INTO #EmployerEntityTypeAccess FROM @EmployerEntityAccess;
+	EXEC [acc].[spGetEmployerEntityTypeAccess] @UserId, @ContextOrganizationId, DEFAULT;
+
+	DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+	DECLARE @Employers [udt].[KeyList];
+	
+	INSERT INTO @Employers
+	SELECT
+		[EO].[OrganizationId]
+	FROM #TimecardEntityTypeAccess [TEA]
+		INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [TEA].[EntityInfoId] AND [EO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId
+	UNION
+	SELECT [OrganizationId] FROM #EmployerEntityTypeAccess
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		DEFAULT,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @UserOrganizations [udt].[KeyList];
+	INSERT INTO @UserOrganizations
+	SELECT [OrganizationId] FROM [acc].[fnGetUserOrganizations] (@UserId, @ContextOrganizationId);
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+
+		;WITH [ItemsFilter] AS (
+			SELECT
+				[CC].[Id],
+				[CC].[Name],
+				[acc].[fnGetOrganizationName]([O].[Id], @UserOrganizations) AS [EmployerName],
+				ROW_NUMBER() OVER (ORDER BY [O].[Id] ASC) AS [RowNumber]
+			FROM @Employers [O]
+				INNER JOIN [acc].[CostCenter] [CC] ON [CC].[OrganizationId] = [O].[Id]
+			' + @ItemsWhereClause + '
+		)
+		SELECT
+			[IF].[Id],
+			[IF].[Name],
+			[IF].[EmployerName],
+			(SELECT
+				COUNT([T].[Id])
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]
+				' + @JoinClause + '
+			' + @WhereClause + N' AND [T].[CostCenterId] = [IF].[Id]
+			) AS [Count]
+		FROM [ItemsFilter] [IF]
+		WHERE [IF].[RowNumber] > @ItemsSkip AND [IF].[RowNumber] <= @ItemsSkip + @ItemsTake
+		ORDER BY [IF].[RowNumber];';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@UserOrganizations [udt].[KeyList] READONLY,
+		@Employers [udt].[KeyList] READONLY,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT,
+		@ItemsSearchRegEx NVARCHAR(MAX),
+		@ItemsSkip INT,
+		@ItemsTake INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@UserOrganizations,
+		@Employers,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@ItemsSearchRegEx,
+		@ItemsSkip,
+		@ItemsTake;
+
+	DROP TABLE #EmployerEntityTypeAccess;
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardDownloadItems]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@EntityIds [udt].[KeyValueList] READONLY,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@NumberSortOrder TINYINT,
+	@FormattedNameSortOrder TINYINT,
+	@LastNameSortOrder TINYINT
+AS
+BEGIN
+
+	DECLARE @EntityInfoIds [udt].[KeyList]
+	INSERT INTO @EntityInfoIds
+	SELECT [Key] FROM @EntityIds;
+
+	DECLARE @TimecardEntityAccess [udt].[EntityAccess_new];
+	INSERT INTO @TimecardEntityAccess
+	EXEC [time].[spGetTimecardEntityAccess] @UserId, @ContextOrganizationId, @EntityInfoIds;
+
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	); 
+
+	INSERT INTO #TimecardEntityTypeAccess ([UserOrganizationId], [EntityInfoId], [OrganizationId], [EntityTypeId], [EntityStateId], [AccessTypeId])
+	SELECT
+		[TEA].*
+	FROM @TimecardEntityAccess [TEA]
+		INNER JOIN [time].[Timecard] [T] WITH(NOLOCK) ON [T].[EntityInfoId] = [TEA].[EntityInfoId]
+		INNER JOIN @EntityIds [EI] ON [EI].[Key] = [T].[EntityInfoId] AND [EI].[Value] = [TEA].[OrganizationId]
+
+	IF NOT EXISTS(SELECT * FROM #TimecardEntityTypeAccess)
+	BEGIN
+		EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+	END;
+
+	DECLARE @UserOrganizations [udt].[KeyList];
+	INSERT INTO @UserOrganizations
+	SELECT [OrganizationId] FROM [acc].[fnGetUserOrganizations] (@UserId, @ContextOrganizationId);
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@NumberSortOrder,
+		@FormattedNameSortOrder,
+		@LastNameSortOrder;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+		DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+		DECLARE @OwnerEntityUserTypeId INT = 1;
+
+		CREATE TABLE #TimecardFilter (
+			[Id] INT NOT NULL,
+			[EntityInfoId] INT NOT NULL,
+			[OrganizationId] INT NOT NULL,
+			[EntityStateId] INT NOT NULL,
+			[AccessTypeId] INT NOT NULL,
+			[RowNumber] INT NOT NULL
+		);
+
+		INSERT INTO #TimecardFilter
+		SELECT
+			[T].[Id],
+			[T].[EntityInfoId],
+			[TEA].[OrganizationId],
+			[TEA].[EntityStateId],
+			[TEA].[AccessTypeId],
+			ROW_NUMBER() OVER (ORDER BY ' + @OrderClause + N') AS [RowNumber]
+		FROM [time].[Timecard] [T] WITH(NOLOCK)
+			INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]'
+			+ @JoinClause
+		+ @WhereClause + N'
+
+		SELECT TOP (10000)
+			[EI].[EntityTypeId],
+			[TF].[OrganizationId],
+			[TF].[EntityStateId],
+			[EI].[Number],
+			[T].[Version],
+			[EO].[EntityOrganizationTypeId],
+			[acc].[fnGetOrganizationName] ([EEEO].[Id], @UserOrganizations) AS [EmployerName],
+			[CEO].[OrganizationId] AS [CandidateId],
+			CAST(DECRYPTBYKEY([U].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) AS [CandidateFormattedName],
+			[T].[ContractId],
+			[C].[Number] AS [ContractNumber],
+			CAST([C].[Version] as INT) AS [ContractVersion],
+			[C].[JobTitle] AS [ContractJobTitle],
+			[T].[StartDateUtc],
+			[CC].[Name] AS [CostCenterName],
+			[AV].[NormalHours],
+			[AV].[NormalAddedManuallyHours],
+			[AV].[OtherHours],
+			[AV].[OtherAddedManuallyHours],
+			[AV].[TotalExpensesPay],
+			[AV].[TotalAddedManuallyExpensesPay],
+			[AV].[TotalExpensesBill],
+			[AV].[TotalAddedManuallyExpensesBill],
+			[AV].[TotalPay],
+			[AV].[TotalAddedManuallyPay],
+			[AV].[TotalBill],
+			[AV].[TotalAddedManuallyBill],
+			[AV].[TotalExpensesPayCurrencyId],
+			[AV].[TotalExpensesBillCurrencyId],
+			[AV].[TotalPayCurrencyId],
+			[AV].[TotalBillCurrencyId]
+		FROM [time].[Timecard] [T] WITH(NOLOCK)
+			INNER JOIN #TimecardFilter [TF] ON [TF].[Id] = [T].[Id]
+			INNER JOIN [plt].[EntityInfo] [EI] WITH(NOLOCK) ON [EI].[Id] = [T].[EntityInfoId]
+			INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [EI].[Id] AND [EO].[OrganizationId] = [TF].[OrganizationId]
+			INNER JOIN [plt].[EntityOrganization] [EEO] WITH(NOLOCK) ON [EEO].[EntityInfoId] = [EI].[Id] AND [EEO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId
+			INNER JOIN [acc].[Organization] [EEEO] WITH(NOLOCK) ON [EEEO].[Id] = [EEO].[OrganizationId]
+			INNER JOIN [plt].[EntityOrganization] [CEO] WITH(NOLOCK) ON [CEO].[EntityInfoId] = [EI].[Id] AND [CEO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId
+			INNER JOIN [acc].[Organization] [CO] WITH(NOLOCK) ON [CO].[Id] = [CEO].[OrganizationId]
+			INNER JOIN [plt].[EntityUser] [CEU] WITH(NOLOCK) ON [CEU].[EntityInfoId] = [CO].[EntityInfoId] AND [CEU].[OrganizationId] = [CO].[Id] AND [CEU].[EntityUserTypeId] = @OwnerEntityUserTypeId
+			INNER JOIN [acc].[User] [U] WITH(NOLOCK) ON [U].[Id] = [CEU].[UserId]
+			INNER JOIN [cnt].[Contract] [C] WITH(NOLOCK) ON [C].[Id] = [T].[ContractId]
+			LEFT JOIN [acc].[CostCenter] [CC] WITH(NOLOCK) ON [CC].[Id] = [T].[CostCenterId]
+			CROSS APPLY [time].[fnGetTimecardAmountValues] ([TF].[Id], [EO].[EntityOrganizationTypeId]) [AV]
+		ORDER BY [TF].[RowNumber];
+
+		DROP TABLE #TimecardFilter;';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@UserOrganizations [udt].[KeyList] READONLY,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	 EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@UserOrganizations,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardEmployers]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@ItemsSearch NVARCHAR(128),
+	@ItemsSkip INT,
+	@ItemsTake INT
+AS
+BEGIN
+		CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @ItemsSearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @ItemsWhereClause NVARCHAR(MAX) = '';
+	IF @ItemsSearch IS NOT NULL AND @ItemsSearch != ''
+	BEGIN
+		SET @ItemsSearchRegEx = '%' + @ItemsSearch + '%';
+		SET @ItemsWhereClause = 'WHERE [acc].[fnGetOrganizationName]([O].[Id], @UserOrganizations) LIKE @ItemsSearchRegEx';
+	END;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	DECLARE @EmployerEntityAccess [udt].[EntityAccess_new];
+	SELECT * INTO #EmployerEntityTypeAccess FROM @EmployerEntityAccess;
+	EXEC [acc].[spGetEmployerEntityTypeAccess] @UserId, @ContextOrganizationId, DEFAULT;
+
+	DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+	DECLARE @Employers [udt].[KeyList];
+	
+	INSERT INTO @Employers
+	SELECT
+		[EO].[OrganizationId]
+	FROM #TimecardEntityTypeAccess [TEA]
+		INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [TEA].[EntityInfoId] AND [EO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId
+	UNION
+	SELECT [OrganizationId] FROM #EmployerEntityTypeAccess
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		DEFAULT,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @UserOrganizations [udt].[KeyList];
+	INSERT INTO @UserOrganizations
+	SELECT [OrganizationId] FROM [acc].[fnGetUserOrganizations] (@UserId, @ContextOrganizationId);
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+
+		;WITH [ItemsFilter] AS (
+			SELECT
+				[O].[Id],
+				[acc].[fnGetOrganizationName]([O].[Id], @UserOrganizations) AS [Name],
+				ROW_NUMBER() OVER (ORDER BY [acc].[fnGetOrganizationPath]([O].[Id]) ASC) AS [RowNumber]
+			FROM @Employers [O]
+			' + @ItemsWhereClause + '
+		)
+		SELECT
+			[IF].[Id] AS [Code],
+			[IF].[Name] AS [Name],
+			(SELECT
+				COUNT([T].[Id])
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]
+				INNER JOIN [plt].[EntityOrganization] [AEO] WITH(NOLOCK) ON
+					[AEO].[EntityInfoId] = [T].[EntityInfoId] AND
+					[AEO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId
+				INNER JOIN [acc].[OrganizationRelation] [AOR] WITH(NOLOCK) ON
+					[AOR].[OrganizationId] = [AEO].[OrganizationId] AND
+					[AOR].[RelatedOrganizationId] = [IF].[Id] AND
+					[AOR].[Level] = 1
+				' + @JoinClause + '
+			' + @WhereClause + N'
+			) AS [Count]
+		FROM [ItemsFilter] [IF]
+		WHERE [IF].[RowNumber] > @ItemsSkip AND [IF].[RowNumber] <= @ItemsSkip + @ItemsTake
+		ORDER BY [IF].[RowNumber];';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@UserOrganizations [udt].[KeyList] READONLY,
+		@Employers [udt].[KeyList] READONLY,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT,
+		@ItemsSearchRegEx NVARCHAR(MAX),
+		@ItemsSkip INT,
+		@ItemsTake INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@UserOrganizations,
+		@Employers,
+		@AgencyIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@ItemsSearchRegEx,
+		@ItemsSkip,
+		@ItemsTake;
+
+	DROP TABLE #EmployerEntityTypeAccess;
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardEntityStates]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@EntityStates [udt].[KeyList] READONLY,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStates, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		DEFAULT,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		SELECT
+			[ESI].[Id] AS [Code],
+			[ES].[NameCode],
+			(SELECT
+				COUNT([T].[Id])
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId] AND [TEA].[EntityStateId] = [ESI].[Id]'
+				+ @JoinClause
+			+ @WhereClause + N') AS [Count]
+		FROM @EntityStates [ESI]
+			INNER JOIN [plt].[EntityState] [ES] WITH(NOLOCK) ON [ES].[Id] = [ESI].[Id];';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@EntityStates [udt].[KeyList] READONLY,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@EntityStates,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardEntityStatuses]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	DECLARE @EntityStatusIds [udt].[KeyList];
+	INSERT INTO @EntityStatusIds
+	SELECT [ES].[Id] FROM [plt].[EntityStatus] [ES] 
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		;WITH [TimecardEntityStatus] AS (
+			SELECT
+					COUNT([T].[Id]) AS [Count],
+					[TEA].[EntityStatusId]
+				FROM [time].[Timecard] [T] WITH(NOLOCK)
+					INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]
+					' + @JoinClause
+				+ @WhereClause + N'
+				GROUP BY [TEA].[EntityStatusId]
+		)
+		SELECT
+			[ES].[Id] AS [Code],
+			[ES].[NameCode],
+			ISNULL([TES].[Count], 0) AS [Count]
+		FROM [plt].[EntityStatus] [ES] WITH(NOLOCK)
+			LEFT JOIN [TimecardEntityStatus] [TES] ON [TES].[EntityStatusId] = [ES].[Id]
+		OPTION (FORCE ORDER);
+		';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@AgencyIds,
+		@EmployerIds,
+		@EntityStatusIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardItems]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@Skip INT,
+	@Take INT,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT,
+	@NumberSortOrder TINYINT,
+	@FormattedNameSortOrder TINYINT,
+	@LastNameSortOrder TINYINT
+AS
+BEGIN
+	-- !!! RELATED STORED PROCEDURES: [time].[spGetTimecardItems], [time].[spGetTimecardKeyIndicators]
+	-- !!! CHECK IF CHANGED
+
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		DEFAULT,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		@NumberSortOrder,
+		@FormattedNameSortOrder,
+		@LastNameSortOrder;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @EmployerEntityOrganizationTypeId INT = 18;
+		DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+		DECLARE @OwnerEntityUserTypeId INT = 1;
+
+		DECLARE @TimecardFilterPage AS TABLE (
+			[Id] INT NOT NULL,
+			[EntityInfoId] INT NOT NULL,
+			[OrganizationId] INT NOT NULL,
+			[EntityStateId] INT NOT NULL,
+			[AccessTypeId] INT NOT NULL,
+			[RowNumber] INT NOT NULL
+		);
+
+		WITH [TimecardFilter] AS (
+			SELECT
+				[T].[Id],
+				[T].[EntityInfoId],
+				[TEA].[OrganizationId],
+				[TEA].[EntityStateId],
+				[TEA].[AccessTypeId],
+				ROW_NUMBER() OVER (ORDER BY ' + @OrderClause + N') AS [RowNumber]
+			FROM [time].[Timecard] [T] WITH(NOLOCK)
+				INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]'
+				+ @JoinClause
+			+ @WhereClause + N'
+		)
+		INSERT INTO @TimecardFilterPage
+		SELECT *
+		FROM [TimecardFilter] [TF]
+		WHERE [TF].[RowNumber] > @Skip AND [TF].[RowNumber] <= @Skip + @Take;
+
+		DECLARE @ContractEntityInfoIds [udt].[KeyList];
+		INSERT INTO @ContractEntityInfoIds
+		SELECT DISTINCT [C].[EntityInfoId]
+		FROM [time].[Timecard] [T] WITH(NOLOCK)
+			INNER JOIN @TimecardFilterPage [TF] ON [TF].[EntityInfoId] = [T].[EntityInfoId]
+			INNER JOIN [cnt].[Contract] [C] WITH (NOLOCK) ON [C].[Id] = [T].[ContractId]
+
+		DECLARE @ContractEntityAccess [udt].[EntityAccess_new];
+		INSERT INTO @ContractEntityAccess
+		EXEC [cnt].[spGetContractEntityAccess] @UserId, @ContextOrganizationId, @ContractEntityInfoIds;
+
+		SELECT
+			[T].[Id],
+			[T].[EntityInfoId],
+			[EI].[EntityTypeId],
+			[TF].[OrganizationId],
+			[TF].[EntityStateId],
+			[time].[fnGetTimecardEntityStatus] ([TF].[EntityInfoId], [TF].[OrganizationId], [TF].[AccessTypeId]) AS [EntityStatusId],
+			[TF].[AccessTypeId],
+			[EI].[Number],
+			[T].[Version],
+			[EO].[EntityOrganizationTypeId],
+			[EEO].[OrganizationId] AS [EmployerId],
+			[CEO].[OrganizationId] AS [CandidateId],
+			CAST(DECRYPTBYKEY([U].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) AS [CandidateFormattedName],
+			[T].[ContractId],
+			[CEA].[OrganizationId] AS [ContractOrganizationId],
+			[C].[Number] AS [ContractNumber],
+			[C].[Version] AS [ContractVersion],
+			[C].[JobTitle] AS [ContractJobTitle],
+			[T].[StartDateUtc],
+			[T].[EndDateUtc],
+			[CC].[Name] AS [CostCenterName],
+			[AV].[NormalHours],
+			[AV].[NormalAddedManuallyHours],
+			[AV].[OtherHours],
+			[AV].[OtherAddedManuallyHours],
+			[AV].[TotalExpensesPay],
+			[AV].[TotalAddedManuallyExpensesPay],
+			[AV].[TotalExpensesBill],
+			[AV].[TotalAddedManuallyExpensesBill],
+			[AV].[TotalPay],
+			[AV].[TotalAddedManuallyPay],
+			[AV].[TotalBill],
+			[AV].[TotalAddedManuallyBill],
+			[AV].[TotalExpensesPayCurrencyId],
+			[AV].[TotalExpensesBillCurrencyId],
+			[AV].[TotalPayCurrencyId],
+			[AV].[TotalBillCurrencyId],
+			[time].[fnGetTimecardDocumentCount] ([T].[Id]) AS [DocumentsCount]
+		FROM [time].[Timecard] [T] WITH(NOLOCK)
+			INNER JOIN @TimecardFilterPage [TF] ON [TF].[Id] = [T].[Id]
+			INNER JOIN [plt].[EntityInfo] [EI] WITH(NOLOCK) ON [EI].[Id] = [T].[EntityInfoId]
+			INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [EI].[Id] AND [EO].[OrganizationId] = [TF].[OrganizationId]
+			INNER JOIN [plt].[EntityOrganization] [EEO] WITH(NOLOCK) ON [EEO].[EntityInfoId] = [EI].[Id] AND [EEO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId
+			INNER JOIN [plt].[EntityOrganization] [CEO] WITH(NOLOCK) ON [CEO].[EntityInfoId] = [EI].[Id] AND [CEO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId
+			INNER JOIN [acc].[Organization] [CO] WITH(NOLOCK) ON [CO].[Id] = [CEO].[OrganizationId]
+			INNER JOIN [plt].[EntityUser] [CEU] WITH(NOLOCK) ON [CEU].[EntityInfoId] = [CO].[EntityInfoId] AND [CEU].[OrganizationId] = [CO].[Id] AND [CEU].[EntityUserTypeId] = @OwnerEntityUserTypeId
+			INNER JOIN [acc].[User] [U] WITH(NOLOCK) ON [U].[Id] = [CEU].[UserId]
+			INNER JOIN [cnt].[Contract] [C] WITH(NOLOCK) ON [C].[Id] = [T].[ContractId]
+			LEFT JOIN @ContractEntityAccess [CEA] ON [CEA].[EntityInfoId] = [C].[EntityInfoId]
+			LEFT JOIN [acc].[CostCenter] [CC] WITH(NOLOCK) ON [CC].[Id] = [T].[CostCenterId]
+			CROSS APPLY [time].[fnGetTimecardAmountValues] ([TF].[Id], [EO].[EntityOrganizationTypeId]) [AV]
+		ORDER BY [TF].[RowNumber];
+
+		SELECT
+			[CI].[Id],
+			CAST(DECRYPTBYKEY([U].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) AS [FormattedName]
+		FROM @CandidateIds [CI]
+			INNER JOIN [acc].[Organization] [CO] WITH(NOLOCK) ON [CO].[Id] = [CI].[Id]
+			INNER JOIN [plt].[EntityUser] [COEU] WITH(NOLOCK) ON [COEU].[EntityInfoId] = [CO].[EntityInfoId] AND [COEU].[OrganizationId] = [CO].[Id] AND [COEU].[EntityUserTypeId] = @OwnerEntityUserTypeId
+			INNER JOIN [acc].[User] [U] WITH(NOLOCK) ON [U].[Id] = [COEU].[UserId];
+
+		SELECT 0;
+
+		SELECT
+			[Id],
+			[Number],
+			[Version],
+			[JobTitle]
+		FROM [cnt].[Contract] WITH(NOLOCK) WHERE [Id] = @ContractId;
+
+		DECLARE @TimecardFilterOrganizationIds [udt].[KeyList];
+		INSERT INTO @TimecardFilterOrganizationIds
+		SELECT
+			[EO].[OrganizationId]
+		FROM @TimecardFilterPage [TF]
+			INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [TF].[EntityInfoId]
+		WHERE ([EO].[EntityOrganizationTypeId] = @EmployerEntityOrganizationTypeId OR [EO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId)
+		UNION
+		SELECT [Id] FROM @AgencyIds
+		UNION
+		SELECT [Id] FROM @EmployerIds;
+
+		SELECT * FROM [acc].[fnGetOrganizationRelationChain](@TimecardFilterOrganizationIds);';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@ContextOrganizationId INT,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@Skip INT,
+		@Take INT,
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	 EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@ContextOrganizationId,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds, 
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@Skip,
+		@Take,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardItemsCount]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		DEFAULT,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @CandidateEntityOrganizationTypeId INT = 95;
+		DECLARE @OwnerEntityUserTypeId INT = 1;
+
+		SELECT
+			COUNT(*)
+		FROM [time].[Timecard] [T] WITH(NOLOCK)
+			INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId]
+			' + @JoinClause + '
+		' + @WhereClause + N';
+	';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	 EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardKeyIndicators]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT
+AS
+BEGIN
+	-- !!! RELATED STORED PROCEDURES: [time].[spGetTimecardItems], [time].[spGetTimecardKeyIndicators]
+	-- !!! CHECK IF CHANGED
+
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		DEFAULT,
+		@EntityStatusIds,
+		@SourceIds,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		SELECT
+			COUNT(*)
+		FROM [time].[Timecard] [T] WITH(NOLOCK)
+			INNER JOIN #TimecardEntityTypeAccess [TEA] ON [TEA].[EntityInfoId] = [T].[EntityInfoId] '
+			+ @JoinClause
+		+ @WhereClause;
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@UserId INT,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SourceIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@UserId,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SourceIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spGetTimecardSources]
+	@UserId INT,
+	@ContextOrganizationId INT,
+	@IncludeArchived BIT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@StartDateUtc DATE,
+	@EndDateUtc DATE,
+	@DaysToStartDate SMALLINT,
+	@DaysToEndDate SMALLINT,
+	@ContractId INT,
+	@ShowAllVersions BIT
+AS
+BEGIN
+	CREATE TABLE #TimecardEntityTypeAccess (
+		[UserOrganizationId] INT NOT NULL,
+		[EntityInfoId] INT NOT NULL,
+		[OrganizationId] INT NOT NULL,
+		[EntityTypeId] INT NOT NULL,
+		[EntityStateId] INT NOT NULL,
+		[AccessTypeId] INT NOT NULL,
+		[EntityOrganizationTypeId] INT,
+		[EmployerOrganizationId] INT,
+		[EntityStatusId] INT
+	);
+	EXEC [time].[spGetTimecardEntityTypeAccess] @UserId, @ContextOrganizationId, @EntityStateIds, @IncludeArchived, @StartDateUtc, @EndDateUtc;
+
+	DECLARE @SearchRegEx NVARCHAR(MAX) = '';
+	DECLARE @SqlClause NVARCHAR(MAX) = '';
+	DECLARE @JoinClause NVARCHAR(MAX) = '';
+	DECLARE @WhereClause NVARCHAR(MAX) = '';
+	DECLARE @OrderClause NVARCHAR(MAX) = '';
+
+	EXEC [time].[spInitTimecardFilter]
+		@SearchRegEx OUTPUT,
+		@SqlClause OUTPUT,
+		@JoinClause OUTPUT,
+		@WhereClause OUTPUT,
+		@OrderClause OUTPUT,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		DEFAULT,
+		@Search,
+		@HasDocuments,
+		@ShowAllVersions,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId,
+		NULL,
+		NULL,
+		NULL;
+
+	DECLARE @Sql NVARCHAR(MAX) = @SqlClause + N'
+		DECLARE @GluedOrganizationId INT = 1;
+		DECLARE @TimecardSourceEnityTypeId INT = 356;
+		SELECT
+			[DV].[Id] AS [Code],
+			[DV].[NameCode] AS [NameCode],
+			(SELECT
+				COUNT([T].[Id])
+			FROM #TimecardEntityTypeAccess [TEA]
+				INNER JOIN [time].[Timecard] [T] WITH(NOLOCK) ON [T].[EntityInfoId] = [TEA].[EntityInfoId] AND [T].[SourceId] = [DV].[Id]'
+				+ @JoinClause
+			+ @WhereClause + N') AS [Count]
+		FROM [dom].[DomainValue] [DV] WITH(NOLOCK)
+		WHERE [DV].[EntityTypeId] = @TimecardSourceEnityTypeId AND [DV].[OrganizationId] = @GluedOrganizationId
+		ORDER BY [DV].[Id];';
+
+	DECLARE @Params NVARCHAR(MAX) = N'
+		@ContextOrganizationId INT,
+		@AgencyIds [udt].[KeyList] READONLY,
+		@EmployerIds [udt].[KeyList] READONLY,
+		@CandidateIds [udt].[KeyList] READONLY,
+		@CostCenterIds [udt].[KeyList] READONLY,
+		@EntityStateIds [udt].[KeyList] READONLY,
+		@EntityStatusIds [udt].[KeyList] READONLY,
+		@SearchRegEx NVARCHAR(MAX),
+		@DaysToStartDate SMALLINT,
+		@DaysToEndDate SMALLINT,
+		@ContractId INT';
+
+	EXECUTE sp_executesql @Sql, @Params,
+		@ContextOrganizationId,
+		@AgencyIds,
+		@EmployerIds,
+		@CandidateIds,
+		@CostCenterIds,
+		@EntityStateIds,
+		@EntityStatusIds,
+		@SearchRegEx,
+		@DaysToStartDate,
+		@DaysToEndDate,
+		@ContractId;
+
+	DROP TABLE #TimecardEntityTypeAccess;
+END
+GO
+
+ALTER PROCEDURE [time].[spInitTimecardFilter]
+	@SearchRegEx NVARCHAR(MAX) = '' OUTPUT,
+	@SqlClause NVARCHAR(MAX) = '' OUTPUT,
+	@JoinClause NVARCHAR(MAX) = '' OUTPUT,
+	@WhereClause NVARCHAR(MAX) = '' OUTPUT,
+	@OrderClause NVARCHAR(MAX) = '' OUTPUT,
+	@AgencyIds [udt].[KeyList] READONLY,
+	@EmployerIds [udt].[KeyList] READONLY,
+	@CandidateIds [udt].[KeyList] READONLY,
+	@CostCenterIds [udt].[KeyList] READONLY,
+	@EntityStateIds [udt].[KeyList] READONLY,
+	@EntityStatusIds [udt].[KeyList] READONLY,
+	@SourceIds [udt].[KeyList] READONLY,
+	@Search NVARCHAR(128),
+	@HasDocuments BIT,
+	@ShowAllVersions BIT,
+	@DaysToStartDate SMALLINT = NULL,
+	@DaysToEndDate SMALLINT = NULL,
+	@ContractId INT = NULL,
+	@NumberSortOrder TINYINT = NULL,
+	@FormattedNameSortOrder TINYINT = NULL,
+	@LastNameSortOrder TINYINT = NULL
+AS
+BEGIN
+	--> Joining
+	IF EXISTS(SELECT * FROM @EntityStatusIds)
+	BEGIN
+		SET @SqlClause = N'
+			DECLARE @TimecardAuthorizationSettingId INT = 38;
+			DECLARE @EntityOrganizationTypeEmployerId INT = 18;
+
+			DECLARE @Settings TABLE(
+				[OrganizationId] INT,
+				[TimecardAuthorizationId] INT
+			);
+
+			UPDATE [TEA]
+			SET [EntityOrganizationTypeId] = [EO].[EntityOrganizationTypeId],
+				[EmployerOrganizationId] = [EEO].[OrganizationId]
+			FROM #TimecardEntityTypeAccess [TEA]
+				INNER JOIN [plt].[EntityOrganization] [EO] WITH(NOLOCK) ON [EO].[EntityInfoId] = [TEA].[EntityInfoId] AND [TEA].[OrganizationId] = [EO].[OrganizationId]
+				INNER JOIN [plt].[EntityOrganization] [EEO] WITH(NOLOCK) ON [EEO].[EntityInfoId] = [TEA].[EntityInfoId] AND [EEO].[EntityOrganizationTypeId] = @EntityOrganizationTypeEmployerId;
+
+			DECLARE @SettingsEmployerIds [udt].[KeyList];
+			INSERT INTO @SettingsEmployerIds
+			SELECT
+				DISTINCT [EmployerOrganizationId]
+			FROM #TimecardEntityTypeAccess;
+
+			;WITH [Settings] AS (
+				SELECT
+					[EI].[Id] AS [OrganizationId],
+					[OR].[Order],
+					[SV].[IntValue]
+				FROM @SettingsEmployerIds [EI]
+					INNER JOIN [acc].[OrganizationRelation] [OR] WITH(NOLOCK) ON  [OR].[OrganizationId] = [EI].[Id]
+					INNER JOIN [set].[SettingValue] [SV] WITH(NOLOCK) ON [SV].[OrganizationId] = [OR].[RelatedOrganizationId] AND [SV].[SettingId] = @TimecardAuthorizationSettingId
+			)
+
+			INSERT INTO @Settings
+			SELECT
+				[EI].[Id],
+				[SR].[IntValue] AS [TimecardAuthorizationId]
+			FROM @SettingsEmployerIds [EI]
+				CROSS APPLY (
+					SELECT TOP (1)
+						[IntValue]
+					FROM [Settings]
+					WHERE OrganizationId = [EI].[Id]
+					ORDER BY [Order] ASC
+				) [SR];
+		
+			UPDATE [TEA]
+				SET [EntityStatusId] = [ESS].[EntityStatusId]
+			FROM #TimecardEntityTypeAccess [TEA]
+				INNER JOIN @Settings [S] ON [S].[OrganizationId] = [TEA].[EmployerOrganizationId]
+				INNER JOIN [time].[TimecardEntityStateStatus] [ESS] WITH(NOLOCK) ON [ESS].[EntityStateId] = [TEA].[EntityStateId] 
+					AND [ESS].[EntityOrganizationTypeId] = [TEA].[EntityOrganizationTypeId] 
+					AND (([ESS].[TimecardAuthorizationId] IS NULL AND [S].[TimecardAuthorizationId] IS NULL) OR ([ESS].[TimecardAuthorizationId] = [S].[TimecardAuthorizationId]));
+
+			UPDATE [TEA]
+				SET [EntityStatusId] = 2
+			FROM #TimecardEntityTypeAccess [TEA]
+			WHERE [TEA].[AccessTypeId] < 3 AND [TEA].[EntityStatusId] = 1;
+		';
+	END;
+
+	IF @Search IS NOT NULL AND @Search != '' OR @NumberSortOrder IN (1, 2) OR @FormattedNameSortOrder IN (1, 2) OR @LastNameSortOrder IN (1, 2)
+	BEGIN
+		SET @JoinClause = @JoinClause + '	INNER JOIN [plt].[EntityInfo] [EI] WITH(NOLOCK) ON [EI].[Id] = [T].[EntityInfoId] ';
+	END
+
+	IF @Search IS NOT NULL AND @Search != ''
+	BEGIN
+		SET @JoinClause = @JoinClause + '	INNER JOIN [cnt].[Contract] [C] WITH(NOLOCK) ON [C].[Id] = [T].[ContractId] ';
+	END
+
+	IF @FormattedNameSortOrder IN (1, 2) OR @LastNameSortOrder IN (1, 2)
+	BEGIN
+		SET @JoinClause = @JoinClause + '	INNER JOIN [plt].[EntityOrganization] [CEO] WITH(NOLOCK) ON [CEO].[EntityInfoId] = [EI].[Id] AND [CEO].[EntityOrganizationTypeId] = @CandidateEntityOrganizationTypeId
+											INNER JOIN [acc].[Organization] [CO] WITH(NOLOCK) ON [CO].[Id] = [CEO].[OrganizationId]
+											INNER JOIN [plt].[EntityUser] [CEU] WITH(NOLOCK) ON [CEU].[EntityInfoId] = [CO].[EntityInfoId] AND [CEU].[OrganizationId] = [CO].[Id] AND [CEU].[EntityUserTypeId] = @OwnerEntityUserTypeId
+											INNER JOIN [acc].[User] [U] WITH(NOLOCK) ON [U].[Id] = [CEU].[UserId] ';
+	END
+
+	IF EXISTS(SELECT * FROM @CostCenterIds)
+	BEGIN
+		SET @JoinClause = @JoinClause + ' INNER JOIN @CostCenterIds [CCI] ON [CCI].[Id] = [T].[CostCenterId] ';
+	END
+
+	IF EXISTS(SELECT * FROM @EntityStateIds)
+	BEGIN
+		SET @JoinClause = @JoinClause + ' INNER JOIN @EntityStateIds [ESI] ON [ESI].[Id] = [TEA].[EntityStateId] ';
+	END
+
+	IF EXISTS(SELECT * FROM @SourceIds)
+	BEGIN
+		SET @JoinClause = @JoinClause + ' INNER JOIN @SourceIds [SI] ON [SI].[Id] = [T].[SourceId] ';
+	END
+
+	--> Filtering
+
+	IF EXISTS(SELECT * FROM @AgencyIds)
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' EXISTS(
+			SELECT
+				[OR].[OrganizationId]
+			FROM [plt].[EntityOrganization] [TEO] WITH(NOLOCK)
+				INNER JOIN [acc].[OrganizationRelation] [OR] WITH(NOLOCK) ON [OR].[OrganizationId] = [TEO].[OrganizationId]
+				INNER JOIN @AgencyIds [AI] ON [AI].[Id] = [OR].[RelatedOrganizationId]
+			WHERE [TEO].[EntityInfoId] = [TEA].[EntityInfoId] AND [TEO].[EntityOrganizationTypeId] = 20 AND [OR].[Level] = 1) ';
+	END
+
+	IF EXISTS(SELECT * FROM @EmployerIds)
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' EXISTS(
+			SELECT
+				[OR].[OrganizationId]
+			FROM [plt].[EntityOrganization] [TEO] WITH(NOLOCK)
+				INNER JOIN [acc].[OrganizationRelation] [OR] WITH(NOLOCK) ON [OR].[OrganizationId] = [TEO].[OrganizationId]
+				INNER JOIN @EmployerIds [EID] ON [EID].[Id] = [OR].[RelatedOrganizationId]
+			WHERE [TEO].[EntityInfoId] = [TEA].[EntityInfoId] AND [TEO].[EntityOrganizationTypeId] = 18 AND [OR].[Level] = 1) ';
+	END
+
+	IF EXISTS(SELECT * FROM @CandidateIds)
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' EXISTS(
+			SELECT
+				[OR].[OrganizationId]
+			FROM [plt].[EntityOrganization] [TEO] WITH(NOLOCK)
+				INNER JOIN [acc].[OrganizationRelation] [OR] WITH(NOLOCK) ON [OR].[OrganizationId] = [TEO].[OrganizationId]
+				INNER JOIN @CandidateIds [TI] ON [TI].[Id] = [OR].[RelatedOrganizationId]
+			WHERE [TEO].[EntityInfoId] = [TEA].[EntityInfoId] AND [TEO].[EntityOrganizationTypeId] = 95 AND [OR].[Level] = 1) ';
+	END
+
+	IF EXISTS(SELECT * FROM @EntityStatusIds)
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET	@WhereClause = @WhereClause + '([TEA].[EntityStatusId] IN (SELECT [Id] FROM @EntityStatusIds)) ';
+	END
+
+	IF @Search IS NOT NULL AND @Search != ''
+	BEGIN
+		SET @SearchRegEx = '%' + @Search + '%';
+
+		IF @WhereClause != '' 
+			SET @WhereClause = @WhereClause + ' AND ';
+
+		SET @WhereClause = @WhereClause + '(';
+		SET @WhereClause = @WhereClause  + ' ([C].[JobTitle] LIKE @SearchRegEx) ';
+
+		DECLARE @Number VARCHAR(8);
+		DECLARE @Version VARCHAR(8);
+		SELECT @Number = [Number], @Version = [Version] FROM [plt].[fnGetEntityNumberAndVersion](@Search);
+
+		IF (@Number IS NOT NULL AND @Version IS NOT NULL)
+		BEGIN
+			SET @WhereClause = @WhereClause  + ' OR ([C].[Number] = ''' + @Number + ''' AND [C].[Version] = ' + @Version + ') ';
+			SET @WhereClause = @WhereClause  + ' OR ([EI].[Number] = ''' + @Number + ''' AND [T].[Version] = ' + @Version + ') ';
+		END
+		ELSE IF (@Number IS NOT NULL)
+			SET @WhereClause = @WhereClause  + ' OR ([C].[Number] = ''' + @Number + ''' OR [EI].[Number] = ''' + @Number + ''') ';
+
+		SET @WhereClause = @WhereClause + ')';
+	END
+
+	IF @HasDocuments IS NOT NULL BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		IF @HasDocuments = 1
+			SET @WhereClause = @WhereClause + ' EXISTS (SELECT * FROM [time].[TimecardDocument] [TD] WITH(NOLOCK) WHERE [TD].[TimecardId] = [T].[Id]) ';
+		ELSE
+			SET @WhereClause = @WhereClause + ' NOT EXISTS (SELECT * FROM [time].[TimecardDocument] [TD] WITH(NOLOCK) WHERE [TD].[TimecardId] = [T].[Id]) ';
+	END;
+
+	IF @DaysToStartDate IS NOT NULL
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' (DATEDIFF(DAY,GETUTCDATE(), [T].[StartDateUtc]) >= @DaysToStartDate) ';
+	END
+
+	IF @DaysToEndDate IS NOT NULL
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' (DATEDIFF(DAY,GETUTCDATE(), [T].[EndDateUtc]) <= @DaysToEndDate) ';
+	END
+
+	IF @ContractId IS NOT NULL
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' ([T].[ContractId] = @ContractId) ';
+	END
+
+	IF @ShowAllVersions = 0
+	BEGIN
+		IF @WhereClause != '' SET @WhereClause = @WhereClause + ' AND ';
+		SET @WhereClause = @WhereClause + ' ([T].[IsLast] = 1) ';
+	END
+
+	IF @WhereClause != ''
+		SET @WhereClause = ' WHERE ' + @WhereClause;
+
+	--> Ordering
+
+	IF @NumberSortOrder = 1
+		SET @OrderClause = @OrderClause + ' [EI].[Number] ASC ';
+	ELSE IF @NumberSortOrder = 2
+		SET @OrderClause = @OrderClause + ' [EI].[Number] DESC ';
+	ELSE IF @FormattedNameSortOrder = 1
+		SET @OrderClause = @OrderClause + ' CAST(DECRYPTBYKEY([U].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) ASC ';
+	ELSE IF @FormattedNameSortOrder = 2
+		SET @OrderClause = @OrderClause + ' CAST(DECRYPTBYKEY([U].[FormattedNameEncrypted]) AS NVARCHAR(MAX)) DESC ';
+	ELSE IF @LastNameSortOrder = 1
+		SET @OrderClause = @OrderClause + ' CAST(DECRYPTBYKEY([U].[LastNameEncrypted]) AS NVARCHAR(MAX)) ASC ';
+	ELSE IF @LastNameSortOrder = 2
+		SET @OrderClause = @OrderClause + ' CAST(DECRYPTBYKEY([U].[LastNameEncrypted]) AS NVARCHAR(MAX)) DESC ';
+	ELSE
+		SET @OrderClause = @OrderClause + '[T].[StartDateUtc] DESC';
+END
+GO
+
